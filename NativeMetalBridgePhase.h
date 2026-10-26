@@ -12,6 +12,7 @@
 #include "bridge/FrontendChecks.h"
 #include "NativeBridgeMetalFrontend.h"
 #include "GpuScanoutClient.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <sys/mman.h>
@@ -91,6 +92,58 @@ struct ScanoutContext {
     Gpu link;
     Gpu *marker;
 };
+// myron: the PosterBoard diagnostic into the kernel's telemetry row table (the same markers the bridge's own rows use:
+// 0xC000|row starts a row, 0x8000|(a<<7)|b appends two characters). backboardd reads its own Caches directory; an
+// OSLogStore query in this thread stalled the render server, so the daemon writes pb.txt and this only reads it.
+static void sendTelemetryRow(Gpu &gpu, unsigned row, const char *text) {
+    if (row >= 48) return;
+    gpu.mark(0xC000u | row);
+    const size_t length = strlen(text) < 90 ? strlen(text) : 90;
+    for (size_t i = 0; i < length; i += 2) {
+        const unsigned a = (unsigned char)text[i] & 0x7f;
+        const unsigned b = i + 1 < length ? (unsigned char)text[i + 1] & 0x7f : 0;
+        gpu.mark(0x8000u | (a << 7) | b);
+    }
+}
+static void posterDiagnostic(char *out, size_t cap) {
+    static const char *const paths[] = {
+        "/private/var/mobile/Library/PosterBoard",
+        "/private/var/mobile/Library/com.apple.PosterBoard",
+        "/private/var/mobile/Containers/Shared/AppGroup",
+        "/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/zz-oslog",
+    };
+    char flags[5] = {};
+    for (unsigned i = 0; i < 4; ++i) {
+        errno = 0;
+        flags[i] = access(paths[i], F_OK) == 0 ? 'y' : errno == EACCES ? '?' : 'n';
+    }
+    char first[160] = {};
+    int fd = open("/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/zz-oslog/pb.txt", O_RDONLY);
+    if (fd >= 0) {
+        char log[1024] = {};
+        const ssize_t n = read(fd, log, sizeof log - 1);
+        close(fd);
+        if (n > 0) {
+            char *p = log;
+            while (*p) {
+                while (*p == '#' || *p == 10 || *p == 13) {   /* newline, carriage return */
+                    while (*p && *p != 10) ++p;
+                    while (*p == 10 || *p == 13) ++p;
+                }
+                if (!*p) break;
+                char *e = p;
+                while (*e && *e != 10 && *e != 13) ++e;
+                size_t len = (size_t)(e - p);
+                if (len >= sizeof first) len = sizeof first - 1;
+                memcpy(first, p, len);
+                first[len] = 0;
+                break;
+            }
+        }
+    }
+    if (first[0]) snprintf(out, cap, "PB %s %.78s", flags, first);
+    else snprintf(out, cap, "PB %s nolog", flags);
+}
 static void serveScanout(Gpu &gpu, id device) {
     ScanoutContext context;
     context.marker = &gpu;

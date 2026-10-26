@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <zlib.h>
 #include <string>
+#include <string.h>
 
 namespace {
 
@@ -51,6 +52,10 @@ void writePass(unsigned pass) {
             if (!entries) gzprintf(out, "# no entries: %s\n", (error ? error.description : @"nil").UTF8String);
             NSDate *start = nil;
             uint64_t lines = 0;
+            // A small plain-text excerpt for the kernel's diagnostic page: the *latest* PosterBoard/PBF logger line
+            // (subsystem/category only — matching the process picked up PosterBoard's Metal noise). The boot page
+            // cannot gunzip the full file, so this stays plain and bounded.
+            NSString *poster = nil;
             for (id entry in entries) {
                 @autoreleasepool {
                     if (++lines > kLineLimit) {
@@ -69,9 +74,22 @@ void writePass(unsigned pass) {
                     const NSInteger level = isLog ? [[entry valueForKey:@"level"] integerValue] : 0;
                     gzprintf(out, "%9.3f %5d %s %s:%s %s %s\n", at, pid, process.UTF8String ?: "?", subsystem.UTF8String ?: "",
                              category.UTF8String ?: "", levelName(level), message.UTF8String ?: "");
+                    if ([subsystem containsString:@"PosterBoard"] || [subsystem containsString:@"PBF"] || [subsystem containsString:@"Poster"] ||
+                        [category containsString:@"Poster"] || [category containsString:@"DataStore"]) {
+                        poster = [NSString stringWithFormat:@"%s %@ %@", levelName(level), category, message ?: @"?"];
+                    }
                 }
             }
             gzprintf(out, "# %llu entries\n", (unsigned long long)lines);
+            if (poster.length) {
+                NSData *plain = [poster dataUsingEncoding:NSUTF8StringEncoding];
+                const std::string ptemporary = directory + "/.pb.txt", pfinal = directory + "/pb.txt";
+                NSString *ptemporaryPath = [NSString stringWithUTF8String:ptemporary.c_str()];
+                if ([plain writeToFile:ptemporaryPath atomically:NO]) {
+                    chmod(ptemporary.c_str(), 0644);
+                    rename(ptemporary.c_str(), pfinal.c_str());
+                }
+            }
         }
         if (gzclose(out) == Z_OK) {
             chmod(temporary.c_str(), 0644);
@@ -91,5 +109,38 @@ extern "C" void nativeOsLogExport() {
         struct stat st = {};
         if (stat(kDirectory, &st) == 0 && S_ISDIR(st.st_mode)) writePass(pass);
         sleep(kPeriodSeconds);
+    }
+}
+
+// Latest one-line PosterBoard/PBF log entry, for the plugin's boot-page diagnostic: the render server calls it every ~10 s
+// (its predicate keeps the enumeration to the matching entries). Returns 1 with text, 0 when nothing matched, <0 on refusal.
+extern "C" int nativeOsLogLatest(char *out, unsigned cap) {
+    @autoreleasepool {
+        if (!out || !cap) return -1;
+        out[0] = 0;
+        Class storeClass = NSClassFromString(@"OSLogStore");
+        NSError *error = nil;
+        id store = storeClass ? ((id (*)(Class, SEL, NSInteger, NSError **))objc_msgSend)(storeClass, @selector(storeWithScope:error:), 0, &error) : nil;
+        if (!store) return -1;
+        id position = ((id (*)(id, SEL, NSTimeInterval))objc_msgSend)(store, @selector(positionWithTimeIntervalSinceLatestBoot:), 0);
+        NSString *latest = nil;
+        @try {
+            NSPredicate *predicate = [NSPredicate predicateWithFormat:
+                @"subsystem CONTAINS 'PosterBoard' OR subsystem CONTAINS 'PBF' OR category CONTAINS 'Poster' OR category CONTAINS 'DataStore'"];
+            id entries = ((id (*)(id, SEL, NSUInteger, id, id, NSError **))objc_msgSend)(
+                store, @selector(entriesEnumeratorWithOptions:position:predicate:error:), 0, position, predicate, &error);
+            if (!entries) return -2;
+            for (id entry in entries) {
+                NSString *message = [entry valueForKey:@"composedMessage"];
+                NSString *category = [entry respondsToSelector:@selector(category)] ? [entry valueForKey:@"category"] : @"";
+                latest = [NSString stringWithFormat:@"%@ %@", category ?: @"", message ?: @"?"];
+            }
+        } @catch (NSException *exception) {
+            (void)exception;
+            return -3;
+        }
+        if (!latest) return 0;
+        strlcpy(out, latest.UTF8String ?: "", cap);
+        return 1;
     }
 }

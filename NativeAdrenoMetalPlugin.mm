@@ -10,6 +10,8 @@
 #import <Foundation/Foundation.h>
 #include <pthread.h>
 #include <dlfcn.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <pwd.h>
 #include <mach/mach.h>
@@ -348,6 +350,12 @@ static id deviceForPort(unsigned port) {
                     ++row;
                     if (!end) break;
                     line = end + 1;
+                }
+                // myron: the PosterBoard diagnostic as one extra row (47); only the render server can read its own Caches.
+                if (!strcmp(getprogname(), "backboardd")) {
+                    char diag[96];
+                    bridgephase::posterDiagnostic(diag, sizeof diag);
+                    bridgephase::sendTelemetryRow(*g, 47, diag);
                 }
                 sleep(6);
             }

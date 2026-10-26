@@ -113,6 +113,35 @@ void report(Gpu &gpu, const char *process, int step, int error, int verified, in
     gpu.method(NativeAdrenoMethodSetMetadata, &meta, sizeof meta, nullptr, 0);
 }
 
+// One diagnostic line for the boot page's PBF rows: the driver records SetMetadata text before validating the handle
+// (NativeAdrenoPublish.cpp), so a bogus handle is enough. Opens its own connection and uses the same tunnel (or mailbox)
+// the test probes for; the launchd daemon is unsandboxed, the in-process plugin is not.
+static inline int adrenoPublishText(unsigned port, const char *text) {
+    void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL);
+    if (!iokit) return -1;
+    Gpu gpu;
+    gpu.call = (CallFn)dlsym(iokit, "IOConnectCallStructMethod");
+    gpu.map = (MapFn)dlsym(iokit, "IOConnectMapMemory64");
+    gpu.unmap = (UnmapFn)dlsym(iokit, "IOConnectUnmapMemory64");
+    gpu.port = port;
+    gpu.openFn = (IOServiceOpenFn)dlsym(iokit, "IOServiceOpen");
+    gpu.closeFn = (IOServiceCloseFn)dlsym(iokit, "IOServiceClose");
+    if (!gpu.openFn || !gpu.closeFn || !gpu.call || !gpu.map || !gpu.unmap) return -1;
+    if (gpu.openFn(port, mach_task_self(), 0x4147, &gpu.conn) != 0 || !gpu.conn) return -1;
+    int result = -1;
+    if (gpu.probe() || gpu.openMailbox()) {
+        NativeAdrenoAbiMetadata meta = {};
+        meta.handle = 1;
+        size_t n = strlen(text);
+        if (n > sizeof meta.text) n = sizeof meta.text;
+        meta.bytes = (uint32_t)n;
+        memcpy(meta.text, text, n);
+        result = gpu.method(NativeAdrenoMethodSetMetadata, &meta, sizeof meta, nullptr, 0);
+    }
+    gpu.closeFn(gpu.conn);
+    return result;
+}
+
 // Everything the Turnip backend does for a first submission, in the same order; returns the verified dword count or -1.
 int runTest(Gpu &gpu, uint32_t mapFlags, int &step, int &error) {
     auto check = [&](int status) {
